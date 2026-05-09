@@ -12,8 +12,90 @@
 #include "hnswlib/hnswlib/hnswlib.h"
 #include "flat_scan.h"
 // 可以自行添加需要的头文件
+#include <cstdint>
+#include <utility>
+#include <arm_neon.h>
 
 using namespace hnswlib;
+
+
+inline float inner_product_neon(const float* a, const float* b, size_t dim)
+{
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
+
+    size_t d = 0;
+
+    for (; d + 15 < dim; d += 16) {
+        float32x4_t a0 = vld1q_f32(a + d);
+        float32x4_t b0 = vld1q_f32(b + d);
+        sum0 = vmlaq_f32(sum0, a0, b0);
+
+        float32x4_t a1 = vld1q_f32(a + d + 4);
+        float32x4_t b1 = vld1q_f32(b + d + 4);
+        sum1 = vmlaq_f32(sum1, a1, b1);
+
+        float32x4_t a2 = vld1q_f32(a + d + 8);
+        float32x4_t b2 = vld1q_f32(b + d + 8);
+        sum2 = vmlaq_f32(sum2, a2, b2);
+
+        float32x4_t a3 = vld1q_f32(a + d + 12);
+        float32x4_t b3 = vld1q_f32(b + d + 12);
+        sum3 = vmlaq_f32(sum3, a3, b3);
+    }
+
+    float32x4_t sum01 = vaddq_f32(sum0, sum1);
+    float32x4_t sum23 = vaddq_f32(sum2, sum3);
+    float32x4_t sum = vaddq_f32(sum01, sum23);
+
+    float tmp[4];
+    vst1q_f32(tmp, sum);
+
+    float result = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+
+    // 处理维度不是 16 的倍数时剩余的元素
+    // 本实验 vecdim = 96，理论上不会进入该循环
+    for (; d < dim; ++d) {
+        result += a[d] * b[d];
+    }
+
+    return result;
+}
+
+
+
+std::priority_queue<std::pair<float, uint32_t> > flat_search_simd(
+    float* base,
+    float* query,
+    size_t base_number,
+    size_t vecdim,
+    size_t k
+) {
+    std::priority_queue<std::pair<float, uint32_t> > q;
+
+    for (size_t i = 0; i < base_number; ++i) {
+        const float* base_vec = base + i * vecdim;
+
+        float ip = inner_product_neon(base_vec, query, vecdim);
+        float dis = 1.0f - ip;
+
+        if (q.size() < k) {
+            q.push({dis, static_cast<uint32_t>(i)});
+        } else {
+            if (dis < q.top().first) {
+                q.push({dis, static_cast<uint32_t>(i)});
+                q.pop();
+            }
+        }
+    }
+
+    return q;
+}
+
+
+
 
 template<typename T>
 T *LoadData(std::string data_path, size_t& n, size_t& d)
@@ -94,7 +176,7 @@ int main(int argc, char *argv[])
 
         // 该文件已有代码中你只能修改该函数的调用方式
         // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
-        auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+        auto res = flat_search_simd(base, test_query + i*vecdim, base_number, vecdim, k);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
