@@ -1,0 +1,16 @@
+
+# ANN SIMD experiment generated files
+main
+test.o
+test.e
+*.o
+*.out
+*.log
+core
+.vscode/
+
+# Dataset / large data files
+*.bin
+*.fbin
+files/*
+!files/.gitkeep
