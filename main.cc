@@ -519,7 +519,7 @@ int main(int argc, char *argv[])
 
         // 该文件已有代码中你只能修改该函数的调用方式
         // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
-        const size_t top_p = 10;
+        const size_t top_p = 2000;
 
         auto res = pq_search_adc_simd(
             base,
