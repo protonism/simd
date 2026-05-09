@@ -20,6 +20,9 @@
 #include <cmath>
 #include <climits>
 
+#include <limits>
+#include <cstdlib>
+
 using namespace hnswlib;
 
 
@@ -103,93 +106,331 @@ inline float inner_product_neon_96(const float* a, const float* b)
 }
 
 
-//sq-simd新增量化函数
-inline int8_t quantize_to_int8(float x, float scale)
+//pq-simd
+inline float hsum_f32x4(float32x4_t v)
 {
-    int v = static_cast<int>(std::round(x * scale));
-
-    if (v > 127) v = 127;
-    if (v < -127) v = -127;
-
-    return static_cast<int8_t>(v);
+    float tmp[4];
+    vst1q_f32(tmp, v);
+    return tmp[0] + tmp[1] + tmp[2] + tmp[3];
 }
 
+inline float l2_neon(const float *a, const float *b, size_t dim)
+{
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
 
+    size_t d = 0;
+    for (; d + 7 < dim; d += 8)
+    {
+        float32x4_t da0 = vsubq_f32(vld1q_f32(a + d), vld1q_f32(b + d));
+        float32x4_t da1 = vsubq_f32(vld1q_f32(a + d + 4), vld1q_f32(b + d + 4));
 
-float build_sq_base(
-    const float* base,
-    size_t base_number,
-    size_t vecdim,
-    std::vector<int8_t>& base_sq
-) {
-    float max_abs = 0.0f;
+        sum0 = vmlaq_f32(sum0, da0, da0);
+        sum1 = vmlaq_f32(sum1, da1, da1);
+    }
 
-    for (size_t i = 0; i < base_number * vecdim; ++i) {
-        float v = std::fabs(base[i]);
-        if (v > max_abs) {
-            max_abs = v;
+    float result = hsum_f32x4(vaddq_f32(sum0, sum1));
+
+    for (; d < dim; ++d)
+    {
+        float diff = a[d] - b[d];
+        result += diff * diff;
+    }
+
+    return result;
+}
+
+struct PQIndex
+{
+    size_t M;              // 子空间个数
+    size_t Ks;             // 每个子空间中心数
+    size_t subdim;         // 每个子空间维度
+    size_t vecdim;
+    size_t base_number;
+
+    // codebooks[(m * Ks + c) * subdim + j]
+    std::vector<float> codebooks;
+
+    // codes[i * M + m]
+    std::vector<uint8_t> codes;
+};
+
+inline const float *centroid_ptr(const PQIndex &idx, size_t m, size_t c)
+{
+    return idx.codebooks.data() + (m * idx.Ks + c) * idx.subdim;
+}
+
+inline uint8_t find_nearest_centroid_l2(
+    const float *subvec,
+    const float *centroids,
+    size_t Ks,
+    size_t subdim)
+{
+    float best_dis = std::numeric_limits<float>::max();
+    uint8_t best_id = 0;
+
+    for (size_t c = 0; c < Ks; ++c)
+    {
+        float dis = l2_neon(subvec, centroids + c * subdim, subdim);
+        if (dis < best_dis)
+        {
+            best_dis = dis;
+            best_id = static_cast<uint8_t>(c);
         }
     }
 
-    if (max_abs == 0.0f) {
-        max_abs = 1.0f;
-    }
-
-    float scale = 127.0f / max_abs;
-
-    base_sq.resize(base_number * vecdim);
-
-    for (size_t i = 0; i < base_number * vecdim; ++i) {
-        base_sq[i] = quantize_to_int8(base[i], scale);
-    }
-
-    return scale;
+    return best_id;
 }
 
-
-
-std::priority_queue<std::pair<float, uint32_t> > flat_search_simd(
-    float* base,
-    float* query,
+void train_one_subspace_kmeans(
+    const float *base,
     size_t base_number,
     size_t vecdim,
-    size_t k
-) {
-    std::priority_queue<std::pair<float, uint32_t> > q;
+    size_t m,
+    size_t M,
+    size_t Ks,
+    size_t subdim,
+    size_t train_n,
+    int iters,
+    float *centroids)
+{
+    size_t stride = std::max<size_t>(1, base_number / train_n);
 
-    for (size_t i = 0; i < base_number; ++i) {
-        const float* base_vec = base + i * vecdim;
+    // 初始化：从 base 中抽取 Ks 个子向量作为初始中心
+    for (size_t c = 0; c < Ks; ++c)
+    {
+        size_t id = (c * stride * 7 + c * 13) % base_number;
+        const float *src = base + id * vecdim + m * subdim;
+        std::memcpy(centroids + c * subdim, src, sizeof(float) * subdim);
+    }
 
-        float ip = inner_product_neon(base_vec, query,vecdim);
-        float dis = 1.0f - ip;
+    std::vector<float> sums(Ks * subdim);
+    std::vector<int> counts(Ks);
 
-        if (q.size() < k) {
-            q.push({dis, static_cast<uint32_t>(i)});
-        } else {
-            if (dis < q.top().first) {
-                q.push({dis, static_cast<uint32_t>(i)});
-                q.pop();
+    for (int it = 0; it < iters; ++it)
+    {
+        std::fill(sums.begin(), sums.end(), 0.0f);
+        std::fill(counts.begin(), counts.end(), 0);
+
+        for (size_t t = 0; t < train_n; ++t)
+        {
+            size_t id = (t * stride) % base_number;
+            const float *subvec = base + id * vecdim + m * subdim;
+
+            uint8_t cid = find_nearest_centroid_l2(subvec, centroids, Ks, subdim);
+            counts[cid]++;
+
+            float *sum = sums.data() + cid * subdim;
+            for (size_t j = 0; j < subdim; ++j)
+            {
+                sum[j] += subvec[j];
+            }
+        }
+
+        for (size_t c = 0; c < Ks; ++c)
+        {
+            if (counts[c] == 0)
+            {
+                continue;
+            }
+
+            float inv = 1.0f / counts[c];
+            for (size_t j = 0; j < subdim; ++j)
+            {
+                centroids[c * subdim + j] = sums[c * subdim + j] * inv;
             }
         }
     }
-
-    return q;
 }
 
-
-//新增query量化函数
-void quantize_query(
-    const float* query,
+PQIndex build_pq_index(
+    const float *base,
+    size_t base_number,
     size_t vecdim,
-    float scale,
-    std::vector<int8_t>& query_sq
-) {
-    query_sq.resize(vecdim);
+    size_t M = 8,
+    size_t Ks = 256,
+    size_t train_n = 12000,
+    int iters = 6)
+{
+    if (vecdim % M != 0)
+    {
+        std::cerr << "PQ error: vecdim must be divisible by M\n";
+        std::exit(1);
+    }
 
-    for (size_t d = 0; d < vecdim; ++d) {
-        query_sq[d] = quantize_to_int8(query[d], scale);
+    PQIndex idx;
+    idx.M = M;
+    idx.Ks = Ks;
+    idx.vecdim = vecdim;
+    idx.base_number = base_number;
+    idx.subdim = vecdim / M;
+
+    idx.codebooks.resize(M * Ks * idx.subdim);
+    idx.codes.resize(base_number * M);
+
+    train_n = std::min(train_n, base_number);
+
+    std::cerr << "PQ build: M=" << M
+              << " Ks=" << Ks
+              << " subdim=" << idx.subdim
+              << " train_n=" << train_n
+              << " iters=" << iters << "\n";
+
+    for (size_t m = 0; m < M; ++m)
+    {
+        std::cerr << "train subspace " << m << " / " << M << "\n";
+
+        train_one_subspace_kmeans(
+            base,
+            base_number,
+            vecdim,
+            m,
+            M,
+            Ks,
+            idx.subdim,
+            train_n,
+            iters,
+            idx.codebooks.data() + m * Ks * idx.subdim);
+    }
+
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < static_cast<int64_t>(base_number); ++i)
+    {
+        for (size_t m = 0; m < M; ++m)
+        {
+            const float *subvec = base + static_cast<size_t>(i) * vecdim + m * idx.subdim;
+            const float *centroids = idx.codebooks.data() + m * Ks * idx.subdim;
+
+            idx.codes[static_cast<size_t>(i) * M + m] =
+                find_nearest_centroid_l2(subvec, centroids, Ks, idx.subdim);
+        }
+    }
+
+    std::cerr << "PQ build done. code bytes = " << idx.codes.size() << "\n";
+
+    return idx;
+}
+
+void build_adc_lut_simd(
+    const PQIndex &idx,
+    const float *query,
+    std::vector<float> &lut)
+{
+    lut.resize(idx.M * idx.Ks);
+
+    for (size_t m = 0; m < idx.M; ++m)
+    {
+        const float *qsub = query + m * idx.subdim;
+
+        for (size_t c = 0; c < idx.Ks; ++c)
+        {
+            lut[m * idx.Ks + c] =
+                inner_product_neon(qsub, centroid_ptr(idx, m, c), idx.subdim);
+        }
     }
 }
+
+std::priority_queue<std::pair<float, uint32_t>> pq_search_adc_simd(
+    const float *base,
+    const PQIndex &idx,
+    const float *query,
+    size_t k,
+    size_t top_p)
+{
+    std::vector<float> lut;
+    build_adc_lut_simd(idx, query, lut);
+
+    struct Candidate
+    {
+        float score;    
+        uint32_t id;
+    };
+
+    std::vector<Candidate> scores(idx.base_number);
+
+    for (size_t i = 0; i < idx.base_number; ++i)
+    {
+        const uint8_t *code = idx.codes.data() + i * idx.M;
+        float score = 0.0f;
+
+        if (idx.M == 8)
+        {
+            score += lut[0 * idx.Ks + code[0]];
+            score += lut[1 * idx.Ks + code[1]];
+            score += lut[2 * idx.Ks + code[2]];
+            score += lut[3 * idx.Ks + code[3]];
+            score += lut[4 * idx.Ks + code[4]];
+            score += lut[5 * idx.Ks + code[5]];
+            score += lut[6 * idx.Ks + code[6]];
+            score += lut[7 * idx.Ks + code[7]];
+        }
+        else
+        {
+            for (size_t m = 0; m < idx.M; ++m)
+            {
+                score += lut[m * idx.Ks + code[m]];
+            }
+        }
+
+        scores[i] = {score, static_cast<uint32_t>(i)};
+    }
+
+    if (top_p < k)
+    {
+        top_p = k;
+    }
+
+    if (top_p > scores.size())
+    {
+        top_p = scores.size();
+    }
+
+    if (top_p < scores.size())
+    {
+        std::nth_element(
+            scores.begin(),
+            scores.begin() + top_p,
+            scores.end(),
+            [](const Candidate &a, const Candidate &b)
+            {
+                return a.score > b.score;
+            });
+    }
+
+    std::priority_queue<std::pair<float, uint32_t>> result_heap;
+
+    for (size_t t = 0; t < top_p; ++t)
+    {
+        uint32_t id = scores[t].id;
+        const float *base_vec = base + static_cast<size_t>(id) * idx.vecdim;
+
+        float ip;
+        if (idx.vecdim == 96)
+        {
+            ip = inner_product_neon_96(base_vec, query);
+        }
+        else
+        {
+            ip = inner_product_neon(base_vec, query, idx.vecdim);
+        }
+
+        float dis = 1.0f - ip;
+
+        if (result_heap.size() < k)
+        {
+            result_heap.push({dis, id});
+        }
+        else if (dis < result_heap.top().first)
+        {
+            result_heap.push({dis, id});
+            result_heap.pop();
+        }
+    }
+
+    return result_heap;
+}
+
+
 
 template<typename T>
 T *LoadData(std::string data_path, size_t& n, size_t& d)
@@ -211,133 +452,6 @@ T *LoadData(std::string data_path, size_t& n, size_t& d)
     return data;
 }
 
-
-//sq-simd计算内积
-inline int32_t inner_product_int8_neon(
-    const int8_t* a,
-    const int8_t* b,
-    size_t dim
-) {
-    int32x4_t sum0 = vdupq_n_s32(0);
-    int32x4_t sum1 = vdupq_n_s32(0);
-
-    size_t d = 0;
-
-    for (; d + 15 < dim; d += 16) {
-        int8x16_t va = vld1q_s8(a + d);
-        int8x16_t vb = vld1q_s8(b + d);
-
-        int8x8_t va_low = vget_low_s8(va);
-        int8x8_t va_high = vget_high_s8(va);
-        int8x8_t vb_low = vget_low_s8(vb);
-        int8x8_t vb_high = vget_high_s8(vb);
-
-        int16x8_t prod_low = vmull_s8(va_low, vb_low);
-        int16x8_t prod_high = vmull_s8(va_high, vb_high);
-
-        sum0 = vaddq_s32(sum0, vmovl_s16(vget_low_s16(prod_low)));
-        sum0 = vaddq_s32(sum0, vmovl_s16(vget_high_s16(prod_low)));
-
-        sum1 = vaddq_s32(sum1, vmovl_s16(vget_low_s16(prod_high)));
-        sum1 = vaddq_s32(sum1, vmovl_s16(vget_high_s16(prod_high)));
-    }
-
-    int32x4_t sum = vaddq_s32(sum0, sum1);
-
-    int32_t tmp[4];
-    vst1q_s32(tmp, sum);
-
-    int32_t result = tmp[0] + tmp[1] + tmp[2] + tmp[3];
-
-    for (; d < dim; ++d) {
-        result += static_cast<int32_t>(a[d]) * static_cast<int32_t>(b[d]);
-    }
-
-    return result;
-}
-
-
-
-//sq-simd搜索函数
-std::priority_queue<std::pair<float, uint32_t> > sq_search_simd(
-    float* base,
-    const int8_t* base_sq,
-    float* query,
-    size_t base_number,
-    size_t vecdim,
-    size_t k,
-    size_t top_p,
-    float scale
-) {
-    std::vector<int8_t> query_sq;
-    quantize_query(query, vecdim, scale, query_sq);
-
-    // coarse阶段要找approx_ip最大的top_p
-    // priority_queue默认是大根堆，不方便直接维护最小score
-    // 用greater做小根堆
-    using Candidate = std::pair<int32_t, uint32_t>;
-
-    struct MinScoreCmp {
-        bool operator()(const Candidate& a, const Candidate& b) const {
-            return a.first > b.first;
-        }
-    };
-
-    std::priority_queue<
-        Candidate,
-        std::vector<Candidate>,
-        MinScoreCmp
-    > coarse_heap;
-
-    for (size_t i = 0; i < base_number; ++i) {
-        const int8_t* base_vec_sq = base_sq + i * vecdim;
-
-        int32_t score = inner_product_int8_neon(
-            base_vec_sq,
-            query_sq.data(),
-            vecdim
-        );
-
-        if (coarse_heap.size() < top_p) {
-            coarse_heap.push({score, static_cast<uint32_t>(i)});
-        } else {
-            if (score > coarse_heap.top().first) {
-                coarse_heap.pop();
-                coarse_heap.push({score, static_cast<uint32_t>(i)});
-            }
-        }
-    }
-
-
-    std::vector<uint32_t> candidates;
-    candidates.reserve(coarse_heap.size());
-
-    while (!coarse_heap.empty()) {
-        candidates.push_back(coarse_heap.top().second);
-        coarse_heap.pop();
-    }
-
-    // rerank 阶段对候选集使用原始float向量重新计算精确距离
-    std::priority_queue<std::pair<float, uint32_t> > result_heap;
-
-    for (uint32_t id : candidates) {
-        const float* base_vec = base + static_cast<size_t>(id) * vecdim;
-
-        float ip = inner_product_neon(base_vec, query, vecdim);
-        float dis = 1.0f - ip;
-
-        if (result_heap.size() < k) {
-            result_heap.push({dis, id});
-        } else {
-            if (dis < result_heap.top().first) {
-                result_heap.push({dis, id});
-                result_heap.pop();
-            }
-        }
-    }
-
-    return result_heap;
-}
 
 
 
@@ -378,9 +492,7 @@ int main(int argc, char *argv[])
     auto base = LoadData<float>(data_path + "DEEP100K.base.100k.fbin", base_number, vecdim);
 
 
-    std::vector<int8_t> base_sq;
-    float sq_scale = build_sq_base(base, base_number, vecdim, base_sq);
-    std::cerr << "SQ build done. scale = " << sq_scale << "\n";
+    PQIndex pq = build_pq_index(base, base_number, vecdim, 8, 256, 12000, 6);
 
 
     // 只测试前2000条查询
@@ -407,20 +519,17 @@ int main(int argc, char *argv[])
 
         // 该文件已有代码中你只能修改该函数的调用方式
         // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
-        const size_t top_p = 1000;
-        auto res = sq_search_simd(
+        const size_t top_p = 10;
+
+        auto res = pq_search_adc_simd(
             base,
-            base_sq.data(),
-            test_query + i * vecdim,
-            base_number,
-            vecdim,
+            pq,
+            test_query + static_cast<size_t>(i) * vecdim,
             k,
-            top_p,
-            sq_scale
-        );
+            top_p);
 
 
-        
+
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
         int64_t diff = (newVal.tv_sec * Converter + newVal.tv_usec) - (val.tv_sec * Converter + val.tv_usec);
