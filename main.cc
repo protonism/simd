@@ -64,6 +64,40 @@ inline float inner_product_neon(const float* a, const float* b, size_t dim)
     return result;
 }
 
+//根据 DEEP100K 数据集维度固定为 96 的特点，进一步将 SIMD 内积函数特化为 96 维
+inline float inner_product_neon_96(const float* a, const float* b)
+{
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
+
+    for (int d = 0; d < 96; d += 16) {
+        float32x4_t a0 = vld1q_f32(a + d);
+        float32x4_t b0 = vld1q_f32(b + d);
+        sum0 = vmlaq_f32(sum0, a0, b0);
+
+        float32x4_t a1 = vld1q_f32(a + d + 4);
+        float32x4_t b1 = vld1q_f32(b + d + 4);
+        sum1 = vmlaq_f32(sum1, a1, b1);
+
+        float32x4_t a2 = vld1q_f32(a + d + 8);
+        float32x4_t b2 = vld1q_f32(b + d + 8);
+        sum2 = vmlaq_f32(sum2, a2, b2);
+
+        float32x4_t a3 = vld1q_f32(a + d + 12);
+        float32x4_t b3 = vld1q_f32(b + d + 12);
+        sum3 = vmlaq_f32(sum3, a3, b3);
+    }
+
+    float32x4_t sum = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
+
+    float tmp[4];
+    vst1q_f32(tmp, sum);
+
+    return tmp[0] + tmp[1] + tmp[2] + tmp[3];
+}
+
 
 
 std::priority_queue<std::pair<float, uint32_t> > flat_search_simd(
@@ -78,7 +112,7 @@ std::priority_queue<std::pair<float, uint32_t> > flat_search_simd(
     for (size_t i = 0; i < base_number; ++i) {
         const float* base_vec = base + i * vecdim;
 
-        float ip = inner_product_neon(base_vec, query, vecdim);
+        float ip = inner_product_neon_96(base_vec, query);
         float dis = 1.0f - ip;
 
         if (q.size() < k) {
