@@ -25,8 +25,7 @@
 
 using namespace hnswlib;
 
-
-inline float inner_product_neon(const float* a, const float* b, size_t dim)
+inline float inner_product_neon(const float *a, const float *b, size_t dim)
 {
     float32x4_t sum0 = vdupq_n_f32(0.0f);
     float32x4_t sum1 = vdupq_n_f32(0.0f);
@@ -35,7 +34,8 @@ inline float inner_product_neon(const float* a, const float* b, size_t dim)
 
     size_t d = 0;
 
-    for (; d + 15 < dim; d += 16) {
+    for (; d + 15 < dim; d += 16)
+    {
         float32x4_t a0 = vld1q_f32(a + d);
         float32x4_t b0 = vld1q_f32(b + d);
         sum0 = vmlaq_f32(sum0, a0, b0);
@@ -64,22 +64,24 @@ inline float inner_product_neon(const float* a, const float* b, size_t dim)
 
     // 处理维度不是 16 的倍数时剩余的元素
     // 本实验 vecdim = 96，理论上不会进入该循环
-    for (; d < dim; ++d) {
+    for (; d < dim; ++d)
+    {
         result += a[d] * b[d];
     }
 
     return result;
 }
 
-//根据 DEEP100K 数据集维度固定为 96 的特点，进一步将 SIMD 内积函数特化为 96 维
-inline float inner_product_neon_96(const float* a, const float* b)
+// 根据 DEEP100K 数据集维度固定为 96 的特点，进一步将 SIMD 内积函数特化为 96 维
+inline float inner_product_neon_96(const float *a, const float *b)
 {
     float32x4_t sum0 = vdupq_n_f32(0.0f);
     float32x4_t sum1 = vdupq_n_f32(0.0f);
     float32x4_t sum2 = vdupq_n_f32(0.0f);
     float32x4_t sum3 = vdupq_n_f32(0.0f);
 
-    for (int d = 0; d < 96; d += 16) {
+    for (int d = 0; d < 96; d += 16)
+    {
         float32x4_t a0 = vld1q_f32(a + d);
         float32x4_t b0 = vld1q_f32(b + d);
         sum0 = vmlaq_f32(sum0, a0, b0);
@@ -105,8 +107,7 @@ inline float inner_product_neon_96(const float* a, const float* b)
     return tmp[0] + tmp[1] + tmp[2] + tmp[3];
 }
 
-
-//pq-simd
+// pq-simd
 inline float hsum_f32x4(float32x4_t v)
 {
     float tmp[4];
@@ -142,9 +143,9 @@ inline float l2_neon(const float *a, const float *b, size_t dim)
 
 struct PQIndex
 {
-    size_t M;              // 子空间个数
-    size_t Ks;             // 每个子空间中心数
-    size_t subdim;         // 每个子空间维度
+    size_t M;      // 子空间个数
+    size_t Ks;     // 每个子空间中心数
+    size_t subdim; // 每个子空间维度
     size_t vecdim;
     size_t base_number;
 
@@ -337,18 +338,57 @@ std::priority_queue<std::pair<float, uint32_t>> pq_search_adc_simd(
     size_t k,
     size_t top_p)
 {
-    std::vector<float> lut;
+    //使用 static 让 lut 只分配一次内存
+    static std::vector<float> lut;
+    lut.reserve(idx.M * idx.Ks); // 避免重复分配
     build_adc_lut_simd(idx, query, lut);
 
     struct Candidate
     {
-        float score;    
+        float score;
         uint32_t id;
     };
 
-    std::vector<Candidate> scores(idx.base_number);
+    //使用 static 让 scores 数组变成持久化的缓存块
+    static std::vector<Candidate> scores;
+    if (scores.size() < idx.base_number)
+    {
+        scores.resize(idx.base_number);
+    }
 
-    for (size_t i = 0; i < idx.base_number; ++i)
+    size_t i = 0;
+    
+    // 跨向量并行Batching每次同时处理 4 条向量，让 CPU 预取和指令流水线满载
+    if (idx.M == 8)
+    {
+        for (; i + 3 < idx.base_number; i += 4)
+        {
+            const uint8_t *c0 = idx.codes.data() + (i + 0) * idx.M;
+            const uint8_t *c1 = idx.codes.data() + (i + 1) * idx.M;
+            const uint8_t *c2 = idx.codes.data() + (i + 2) * idx.M;
+            const uint8_t *c3 = idx.codes.data() + (i + 3) * idx.M;
+
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+
+            //交错执行内存加载和加法
+            s0 += lut[0 * idx.Ks + c0[0]]; s1 += lut[0 * idx.Ks + c1[0]]; s2 += lut[0 * idx.Ks + c2[0]]; s3 += lut[0 * idx.Ks + c3[0]];
+            s0 += lut[1 * idx.Ks + c0[1]]; s1 += lut[1 * idx.Ks + c1[1]]; s2 += lut[1 * idx.Ks + c2[1]]; s3 += lut[1 * idx.Ks + c3[1]];
+            s0 += lut[2 * idx.Ks + c0[2]]; s1 += lut[2 * idx.Ks + c1[2]]; s2 += lut[2 * idx.Ks + c2[2]]; s3 += lut[2 * idx.Ks + c3[2]];
+            s0 += lut[3 * idx.Ks + c0[3]]; s1 += lut[3 * idx.Ks + c1[3]]; s2 += lut[3 * idx.Ks + c2[3]]; s3 += lut[3 * idx.Ks + c3[3]];
+            s0 += lut[4 * idx.Ks + c0[4]]; s1 += lut[4 * idx.Ks + c1[4]]; s2 += lut[4 * idx.Ks + c2[4]]; s3 += lut[4 * idx.Ks + c3[4]];
+            s0 += lut[5 * idx.Ks + c0[5]]; s1 += lut[5 * idx.Ks + c1[5]]; s2 += lut[5 * idx.Ks + c2[5]]; s3 += lut[5 * idx.Ks + c3[5]];
+            s0 += lut[6 * idx.Ks + c0[6]]; s1 += lut[6 * idx.Ks + c1[6]]; s2 += lut[6 * idx.Ks + c2[6]]; s3 += lut[6 * idx.Ks + c3[6]];
+            s0 += lut[7 * idx.Ks + c0[7]]; s1 += lut[7 * idx.Ks + c1[7]]; s2 += lut[7 * idx.Ks + c2[7]]; s3 += lut[7 * idx.Ks + c3[7]];
+
+            scores[i + 0] = {s0, static_cast<uint32_t>(i + 0)};
+            scores[i + 1] = {s1, static_cast<uint32_t>(i + 1)};
+            scores[i + 2] = {s2, static_cast<uint32_t>(i + 2)};
+            scores[i + 3] = {s3, static_cast<uint32_t>(i + 3)};
+        }
+    }
+
+    // 尾部处理（处理不能被 4 整除剩余的向量）
+    for (; i < idx.base_number; ++i)
     {
         const uint8_t *code = idx.codes.data() + i * idx.M;
         float score = 0.0f;
@@ -371,7 +411,6 @@ std::priority_queue<std::pair<float, uint32_t>> pq_search_adc_simd(
                 score += lut[m * idx.Ks + code[m]];
             }
         }
-
         scores[i] = {score, static_cast<uint32_t>(i)};
     }
 
@@ -430,30 +469,26 @@ std::priority_queue<std::pair<float, uint32_t>> pq_search_adc_simd(
     return result_heap;
 }
 
-
-
-template<typename T>
-T *LoadData(std::string data_path, size_t& n, size_t& d)
+template <typename T>
+T *LoadData(std::string data_path, size_t &n, size_t &d)
 {
     std::ifstream fin;
     fin.open(data_path, std::ios::in | std::ios::binary);
-    fin.read((char*)&n,4);
-    fin.read((char*)&d,4);
-    T* data = new T[n*d];
+    fin.read((char *)&n, 4);
+    fin.read((char *)&d, 4);
+    T *data = new T[n * d];
     int sz = sizeof(T);
-    for(int i = 0; i < n; ++i){
-        fin.read(((char*)data + i*d*sz), d*sz);
+    for (int i = 0; i < n; ++i)
+    {
+        fin.read(((char *)data + i * d * sz), d * sz);
     }
     fin.close();
 
-    std::cerr<<"load data "<<data_path<<"\n";
-    std::cerr<<"dimension: "<<d<<"  number:"<<n<<"  size_per_element:"<<sizeof(T)<<"\n";
+    std::cerr << "load data " << data_path << "\n";
+    std::cerr << "dimension: " << d << "  number:" << n << "  size_per_element:" << sizeof(T) << "\n";
 
     return data;
 }
-
-
-
 
 struct SearchResult
 {
@@ -461,39 +496,37 @@ struct SearchResult
     int64_t latency; // 单位us
 };
 
-void build_index(float* base, size_t base_number, size_t vecdim)
+void build_index(float *base, size_t base_number, size_t vecdim)
 {
     const int efConstruction = 150; // 为防止索引构建时间过长，efc建议设置200以下
-    const int M = 16; // M建议设置为16以下
+    const int M = 16;               // M建议设置为16以下
 
     HierarchicalNSW<float> *appr_alg;
     InnerProductSpace ipspace(vecdim);
     appr_alg = new HierarchicalNSW<float>(&ipspace, base_number, M, efConstruction);
 
     appr_alg->addPoint(base, 0);
-    #pragma omp parallel for
-    for(int i = 1; i < base_number; ++i) {
-        appr_alg->addPoint(base + 1ll*vecdim*i, i);
+#pragma omp parallel for
+    for (int i = 1; i < base_number; ++i)
+    {
+        appr_alg->addPoint(base + 1ll * vecdim * i, i);
     }
 
     char path_index[1024] = "files/hnsw.index";
     appr_alg->saveIndex(path_index);
 }
 
-
 int main(int argc, char *argv[])
 {
     size_t test_number = 0, base_number = 0;
     size_t test_gt_d = 0, vecdim = 0;
 
-    std::string data_path = "/anndata/"; 
+    std::string data_path = "/anndata/";
     auto test_query = LoadData<float>(data_path + "DEEP100K.query.fbin", test_number, vecdim);
     auto test_gt = LoadData<int>(data_path + "DEEP100K.gt.query.100k.top100.bin", test_number, test_gt_d);
     auto base = LoadData<float>(data_path + "DEEP100K.base.100k.fbin", base_number, vecdim);
 
-
     PQIndex pq = build_pq_index(base, base_number, vecdim, 8, 256, 12000, 6);
-
 
     // 只测试前2000条查询
     test_number = 2000;
@@ -510,16 +543,16 @@ int main(int argc, char *argv[])
     // 下面是一个构建hnsw索引的示例
     // build_index(base, base_number, vecdim);
 
-    
     // 查询测试代码
-    for(int i = 0; i < test_number; ++i) {
+    for (int i = 0; i < test_number; ++i)
+    {
         const unsigned long Converter = 1000 * 1000;
         struct timeval val;
         int ret = gettimeofday(&val, NULL);
 
         // 该文件已有代码中你只能修改该函数的调用方式
         // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
-        const size_t top_p = 2000;
+        const size_t top_p = 1000;
 
         auto res = pq_search_adc_simd(
             base,
@@ -528,39 +561,41 @@ int main(int argc, char *argv[])
             k,
             top_p);
 
-
-
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
         int64_t diff = (newVal.tv_sec * Converter + newVal.tv_usec) - (val.tv_sec * Converter + val.tv_usec);
 
         std::set<uint32_t> gtset;
-        for(int j = 0; j < k; ++j){
-            int t = test_gt[j + i*test_gt_d];
+        for (int j = 0; j < k; ++j)
+        {
+            int t = test_gt[j + i * test_gt_d];
             gtset.insert(t);
         }
 
         size_t acc = 0;
-        while (res.size()) {   
+        while (res.size())
+        {
             int x = res.top().second;
-            if(gtset.find(x) != gtset.end()){
+            if (gtset.find(x) != gtset.end())
+            {
                 ++acc;
             }
             res.pop();
         }
-        float recall = (float)acc/k;
+        float recall = (float)acc / k;
 
         results[i] = {recall, diff};
     }
 
     float avg_recall = 0, avg_latency = 0;
-    for(int i = 0; i < test_number; ++i) {
+    for (int i = 0; i < test_number; ++i)
+    {
         avg_recall += results[i].recall;
         avg_latency += results[i].latency;
     }
 
     // 浮点误差可能导致一些精确算法平均recall不是1
-    std::cout << "average recall: "<<avg_recall / test_number<<"\n";
-    std::cout << "average latency (us): "<<avg_latency / test_number<<"\n";
+    std::cout << "average recall: " << avg_recall / test_number << "\n";
+    std::cout << "average latency (us): " << avg_latency / test_number << "\n";
     return 0;
 }
